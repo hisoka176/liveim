@@ -7,7 +7,15 @@ var socketio = require('socket.io'),
 	redis    = require('redis'),
     redisio  = require('socket.io-redis'),
     request  = require('request'),
-    config   = require('./config.js');
+    config   = require('./config.js'),
+    log4js = require("log4js"),
+    schedule = require('node-schedule');
+
+
+var logConf = require("./logConf.json")
+log4js.configure(logConf)
+var logger = log4js.getLogger("default")
+
 
 var os = require("os")
 var d = domain.create();
@@ -38,6 +46,37 @@ function sensitiveWordFilter(chatString){
 var sockets = {};
 var chat_history={};
 var chat_interval={};
+
+
+// 定时清理消费金额
+function scheduleClearConsume() {
+    schedule.scheduleJob('* * 3 * * *', function () {
+        // 获取房间列表
+        var socket_stream_set = new Set()
+        sockets.forEach(function (x) {
+            socket_stream_set.add(x.stream)
+        })
+        // 清理REDIS用户列表的缓存数据
+        socket_stream_set.forEach(function (x) {
+            clientRedis.hgetall("userlist_"+x,function(err,res){
+                for(var key in res){
+                    var value = JSON.parse(res[key])
+                    value['contribute'] = 0.0
+                    clientRedis.hset("userlist_"+x,key, JSON.stringify(value))
+                }
+
+            })
+        })
+        //清理REDIS消费金额的缓存数据
+        socket_stream_set.forEach(function (x) {
+            clientRedis.del("consume_" + x)
+        })
+
+    });
+}
+
+scheduleClearConsume();
+
 // redis 链接
 var clientRedis  = redis.createClient(config['REDISPORT'],config['REDISHOST']);
 clientRedis.auth(config['REDISPASS']);
@@ -118,7 +157,19 @@ io.on('connection', function(socket) {
 							console.log(userInfo['vip']['type']);
 							var data_str="{\"msg\":[{\"_method_\":\"SendMsg\",\"action\":\"0\",\"ct\":{\"id\":\""+userInfo['id']+"\",\"user_nicename\":\""+userInfo['user_nicename']+"\",\"avatar\":\""+userInfo['avatar']+"\",\"avatar_thumb\":\""+userInfo['avatar_thumb']+"\",\"level\":\""+userInfo['level']+"\",\"vip_type\":\""+userInfo['vip']['type']+"\",\"car_id\":\""+userInfo['car']['id']+"\",\"car_swf\":\""+userInfo['car']['swf']+"\",\"car_swftime\":\""+userInfo['car']['swftime']+"\",\"car_words\":\""+userInfo['car']['words']+"\"},\"msgtype\":\"0\"}],\"retcode\":\"000000\",\"retmsg\":\"OK\"}";
 							process_msg(io,socket.roomnum,data_str);
+
+
 							if(socket.stream){
+                                // 初始化消费
+                                clientRedis.hget('consume_' + socket.stream, socket.sign, function (err,res){
+                                    if(!res){
+                                        clientRedis.hget("consume_" +socket.stream, socket.sign, 0.0)
+                                    }
+                                    userInfo['contribute'] = clientRedis.hget("consume_" +socket.stream, socket.sign)
+                                })
+
+                                res = JSON.stringify(userInfo)
+                                clientRedis.hset('userlist_' + socket.stream, socket.sign, res);
 								clientRedis.hset('userlist_'+socket.stream,socket.sign,res);	
 							}
 						}						
@@ -140,6 +191,8 @@ io.on('connection', function(socket) {
 	socket.on('broadcast',function(data){
             //console.log(data);
 		    if(socket.token != undefined){
+		        logger.info("socket data")
+                logger.info("\n" + data)
 		    	var dataObj  = typeof data == 'object'?data:evalJson(data);
 			    var msg      = dataObj['msg'][0]; 
 			    var token    = dataObj['token'];
